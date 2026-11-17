@@ -1,0 +1,135 @@
+name: Update RSS Feed
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    - cron: "23 */6 * * *"
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: rss-pages
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Build RSS feed
+        run: |
+          mkdir -p public
+          python3 - <<'PY'
+          import re
+          import html
+          import urllib.request
+          import xml.etree.ElementTree as ET
+          from datetime import datetime, timezone
+          from email.utils import format_datetime
+          from urllib.parse import urljoin
+          from zoneinfo import ZoneInfo
+
+          source = "https://www.johnnycox.me/"
+          feed = "https://johcox74.github.io/johnnycox-rss/feed.xml"
+          request = urllib.request.Request(
+              source, headers={"User-Agent": "JohnnyCoxRSS/1.0"}
+          )
+          with urllib.request.urlopen(request, timeout=30) as response:
+              page = response.read().decode("utf-8")
+
+          def clean(text):
+              return html.unescape(re.sub(r"<[^>]+>", "", text)).strip()
+
+          def field(pattern, text):
+              match = re.search(pattern, text, re.S)
+              return match.group(1) if match else ""
+
+          atom = "http://www.w3.org/2005/Atom"
+          ET.register_namespace("atom", atom)
+          root = ET.Element("rss", version="2.0")
+          channel = ET.SubElement(root, "channel")
+
+          def add(parent, tag, text):
+              ET.SubElement(parent, tag).text = text
+
+          add(channel, "title", "I Want to Believe — Johnny Cox")
+          add(channel, "link", source)
+          add(channel, "description", "Articles by Johnny Cox")
+          add(channel, "language", "en-us")
+          add(channel, "lastBuildDate",
+              format_datetime(datetime.now(timezone.utc)))
+          ET.SubElement(channel, f"{{{atom}}}link", {
+              "href": feed,
+              "rel": "self",
+              "type": "application/rss+xml"
+          })
+
+          count = 0
+          for post in re.findall(
+              r"<article\b[^>]*>(.*?)</article>", page, re.S
+          ):
+              title = field(r"<h2\b[^>]*>(.*?)</h2>", post)
+              href = field(r'href="([^"]+)"', title)
+              if not title or not href:
+                  continue
+
+              link = urljoin(source, html.unescape(href))
+              summary = field(
+                  r'<div\b[^>]*class="[^"]*jw-news-post__lead[^"]*"[^>]*>(.*?)</div>',
+                  post
+              )
+              item = ET.SubElement(channel, "item")
+              add(item, "title", clean(title))
+              add(item, "link", link)
+              guid = ET.SubElement(item, "guid", isPermaLink="true")
+              guid.text = link
+              add(item, "description", clean(summary))
+
+              date = clean(field(
+                  r'class="jw-news-date"[^>]*>(.*?)</span>', post
+              ))
+              time = clean(field(
+                  r'class="jw-news-time"[^>]*>(.*?)</span>', post
+              ))
+              if date and time:
+                  stamp = " ".join((date + " " + time).split())
+                  published = datetime.strptime(
+                      stamp, "%b %d, %Y %I:%M %p"
+                  ).replace(tzinfo=ZoneInfo("America/New_York"))
+                  add(item, "pubDate", format_datetime(published))
+              count += 1
+
+          if count == 0:
+              raise RuntimeError("No articles found; keeping existing feed.")
+
+          ET.indent(root)
+          ET.ElementTree(root).write(
+              "public/feed.xml",
+              encoding="utf-8",
+              xml_declaration=True
+          )
+          with open("public/index.html", "w") as output:
+              output.write(
+                  '<!doctype html><title>Johnny Cox RSS</title>'
+                  '<h1>Johnny Cox RSS Feed</h1>'
+                  '<p><a href="feed.xml">Subscribe to the feed</a></p>'
+              )
+          print(f"Created feed with {count} articles.")
+          PY
+
+      - name: Upload feed
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+
+      - name: Publish feed
+        id: deployment
+        uses: actions/deploy-pages@v4
